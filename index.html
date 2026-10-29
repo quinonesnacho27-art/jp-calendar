@@ -197,35 +197,6 @@ select.fi{cursor:pointer}
 </head>
 <body>
 
-<!-- SETUP SCREEN -->
-<div id="setupScreen" style="display:none;padding:20px">
-  <div class="setup">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
-      <div class="logo-sq">JP</div>
-      <div class="setup-title" style="margin:0">Configuración inicial</div>
-    </div>
-    <div class="setup-sub">Esta app guarda los datos en JSONBin.io — un servicio gratuito en la nube. Solo necesitas hacer esto <strong>una vez</strong>. Si un compañero ya configuró el calendario, pídele la <strong>Master Key</strong> y el <strong>BIN ID</strong> y pégalos abajo.</div>
-
-    <div class="setup-step">
-      <strong>Master Key</strong>
-      Te la comparte quien administra el calendario (o créala gratis en <a href="https://jsonbin.io" target="_blank">jsonbin.io</a> → API Keys).
-      <input class="setup-inp" id="setupKey" placeholder="$2b$10$..." />
-      <div class="setup-note">Se guarda solo en tu navegador.</div>
-    </div>
-    <div class="setup-step">
-      <strong>BIN ID</strong>
-      El ID del calendario compartido. Si eres el primero en configurar, déjalo vacío y se crea uno nuevo automáticamente.
-      <input class="setup-inp" id="setupBin" placeholder="Ej: 64abc123... (vacío = crear nuevo)" />
-    </div>
-
-    <div style="margin-top:20px">
-      <button class="btn btn-p" style="width:100%;justify-content:center;padding:12px" onclick="setupSave()">
-        Guardar y continuar →
-      </button>
-    </div>
-  </div>
-</div>
-
 <!-- MAIN APP -->
 <div id="appWrap" style="display:none">
 
@@ -385,10 +356,11 @@ const SEED=[
   {id:'e12',date:'2026-06-19',presenter:'Margarita',topic:'Estrategia Comercial 2do semestre 2026',notes:''},
 ];
 
-const JBIN_API = 'https://api.jsonbin.io/v3';
-const LS_KEY = 'jp_key';
-const LS_BIN = 'jp_bin';
+const SYNC_URL = 'https://script.google.com/macros/s/AKfycbyweuwBd_b9d_wA7QMgZoAN2DI4jYoPVcaX9qiUG4uhDjMx2pbIk_xuyVSgAd-5euGe/exec';
+const SYNC_APP = 'jp-calendar';
 const LS_NAME = 'jp_name';
+const LS_CACHE = 'jp_evs_cache';
+const LS_META = 'jp_sync2';
 
 // ── STATE ─────────────────────────────────────────────────────
 let events = [];
@@ -400,105 +372,118 @@ let editDate = null;
 let pFilt = null;
 let saving = false;
 
-// ── JSONBIN STORAGE ───────────────────────────────────────────
-function getKey(){ return localStorage.getItem(LS_KEY)||''; }
-function getBin(){ return localStorage.getItem(LS_BIN)||''; }
-
-async function jbGet(){
-  const key=getKey(), bin=getBin();
-  if(!key||!bin) return null;
-  const r=await fetch(`${JBIN_API}/b/${bin}/latest`,{headers:{'X-Master-Key':key,'X-Bin-Meta':'false'}});
-  if(!r.ok) throw new Error('GET '+r.status);
+// ── SINCRONIZACIÓN (servidor Apps Script del equipo) ─────────
+// Cada cambio se guarda primero en este navegador y luego en el servidor.
+// El servidor solo acepta la escritura si nadie guardó antes; si alguien lo hizo,
+// se mezclan ambos cambios (por presentación) y se reintenta: no se pisa a nadie.
+// Sin conexión, los cambios quedan pendientes y se envían solos al reconectar.
+const SY = {rev:0, base:null, dirty:false, busy:false, again:false, retryMs:5000, timer:null, lastSync:0, legacy:false};
+function loadMeta(){
+  try{ const m=JSON.parse(localStorage.getItem(LS_META)||'null');
+    if(m){ if(Array.isArray(m.base)){ SY.rev=m.rev||0; SY.base=m.base; SY.dirty=!!m.dirty; } SY.legacy=!!m.legacy; } }catch(e){}
+  // este navegador ya usaba la versión anterior (JSONBin): sus datos se suben al servidor nuevo
+  if(!SY.base && localStorage.getItem('jp_key') && localStorage.getItem(LS_CACHE)) SY.legacy=true;
+  ['jp_key','jp_bin'].forEach(k=>localStorage.removeItem(k));
+  saveMeta();
+}
+function saveMeta(){ try{ localStorage.setItem(LS_META, JSON.stringify({rev:SY.rev, base:SY.base, dirty:SY.dirty, legacy:SY.legacy})); }catch(e){} }
+function cacheEvs(){ try{ localStorage.setItem(LS_CACHE, JSON.stringify(events)); }catch(e){} }
+async function srvCall(opts, url){
+  let r; try{ r=await fetch(url, Object.assign({cache:'no-store'}, opts)); }catch(e){ throw new Error('sin conexión'); }
+  if(!r.ok) throw new Error('servidor '+r.status);
   return await r.json();
 }
-
-async function jbPut(data){
-  const key=getKey(), bin=getBin();
-  if(!key||!bin) throw new Error('No config');
-  const r=await fetch(`${JBIN_API}/b/${bin}`,{
-    method:'PUT',
-    headers:{'Content-Type':'application/json','X-Master-Key':key},
-    body:JSON.stringify(data)
-  });
-  if(!r.ok) throw new Error('PUT '+r.status);
-  return await r.json();
+async function srvGet(){
+  const j=await srvCall({method:'GET'}, SYNC_URL+'?op=get&app='+SYNC_APP+'&t='+Date.now());
+  if(!j.ok) throw new Error(j.error||'servidor');
+  return j.env||null;
 }
-
-async function jbCreate(data){
-  const key=getKey();
-  const r=await fetch(`${JBIN_API}/b`,{
-    method:'POST',
-    headers:{'Content-Type':'application/json','X-Master-Key':key,'X-Bin-Name':'jp-cal-2026'},
-    body:JSON.stringify(data)
-  });
-  if(!r.ok) throw new Error('CREATE '+r.status);
-  const j=await r.json();
-  return j.metadata.id;
+async function srvPut(evs, baseRev, seed){
+  const env={app:SYNC_APP, v:1, enc:'json', savedAt:new Date().toISOString(), savedBy:myName()||'sin nombre', data:{events:evs}};
+  if(seed) env.seed=true;
+  const j=await srvCall({method:'POST', body:JSON.stringify({op:'put', app:SYNC_APP, baseRev:baseRev, env:env})}, SYNC_URL);
+  if(j.ok) return {ok:true, rev:j.rev};
+  if(j.conflict) return {conflict:true, env:j.env||null};
+  throw new Error(j.error||'servidor');
 }
-
-// ── SETUP ─────────────────────────────────────────────────────
-function checkSetup(){
-  const key=getKey();
-  if(!key){
-    document.getElementById('setupScreen').style.display='block';
-    document.getElementById('appWrap').style.display='none';
-  } else {
-    document.getElementById('setupScreen').style.display='none';
-    document.getElementById('appWrap').style.display='block';
-    if(!myName()) document.getElementById('myName').classList.add('warn');
-    loadEvs();
+const evsOf = env => (env && env.data && Array.isArray(env.data.events)) ? env.data.events : null;
+const same = (a,b) => JSON.stringify(a)===JSON.stringify(b);
+/** Mezcla de 3 vías por id. base = última versión sincronizada. */
+function mergeEvs(base, mine, theirs){
+  const B=new Map(base.map(e=>[e.id,e])), M=new Map(mine.map(e=>[e.id,e])), out=[], seen=new Set();
+  for(const t of theirs){
+    seen.add(t.id); const b=B.get(t.id), m=M.get(t.id);
+    if(!m){ if(!b || !same(b,t)) out.push(t); }                 // lo borré yo: se va (salvo que otro lo haya cambiado)
+    else if(same(m,t) || (b && same(m,b))) out.push(t);         // no lo toqué
+    else if(b && same(t,b)) out.push(m);                        // solo lo cambié yo
+    else { const o={...t}; Object.keys(m).forEach(k=>{ if(!b || !same(m[k],b[k])) o[k]=m[k]; }); out.push(o); }  // ambos: mis campos cambiados prevalecen
   }
+  for(const m of mine){ if(seen.has(m.id)) continue; const b=B.get(m.id); if(!b || !same(m,b)) out.push(m); }  // nuevo mío
+  return out;
 }
-
-async function setupSave(){
-  const key=document.getElementById('setupKey').value.trim();
-  const bin=document.getElementById('setupBin').value.trim();
-  if(!key){ toast('Pega la Master Key primero',false); return; }
-  localStorage.setItem(LS_KEY, key);
-  try {
-    if(bin){
-      localStorage.setItem(LS_BIN, bin);
-    } else {
-      const newBin=await jbCreate({events:SEED});
-      localStorage.setItem(LS_BIN, newBin);
+function targetEvs(mine, theirs, env){
+  if(theirs===null) return mine;                                  // servidor vacío: subo lo mío
+  if(SY.base) return mergeEvs(SY.base, mine, theirs);
+  if(SY.legacy) return (env && env.seed) ? mine : mergeEvs([], mine, theirs);   // migración: unión
+  return theirs;                                                  // dispositivo nuevo: tomo lo del equipo
+}
+async function syncNow(){
+  if(SY.busy){ SY.again=true; return; }
+  SY.busy=true; clearTimeout(SY.timer);
+  setSyn(SY.dirty?'Guardando...':'Sincronizando...', false);
+  try{
+    const mine=JSON.parse(JSON.stringify(events));
+    let env=(SY.base && SY.dirty) ? {local:true} : await srvGet();
+    let done=null;
+    for(let i=0;i<6 && !done;i++){
+      let theirs=null, rev=0;
+      if(env && env.local){ theirs=SY.base; rev=SY.rev; }
+      else if(env){ theirs=evsOf(env); rev=env.rev||0; }
+      const want=targetEvs(mine, theirs, env);
+      if(theirs!==null && same(want, theirs)){ done={evs:theirs, rev:rev}; break; }
+      const res=await srvPut(want, rev, theirs===null && !SY.base && !SY.legacy);
+      if(res.ok) done={evs:want, rev:res.rev}; else env=res.env;
     }
-    checkSetup();
-  } catch(e){
-    toast('Error: verifica tu Master Key — '+e.message, false);
+    if(!done) throw new Error('mucha actividad simultánea');
+    SY.base=JSON.parse(JSON.stringify(done.evs)); SY.rev=done.rev; SY.legacy=false; SY.lastSync=Date.now(); SY.retryMs=5000;
+    if(same(events, mine)){ events=JSON.parse(JSON.stringify(done.evs)); SY.dirty=false; }
+    else { events=mergeEvs(mine, events, done.evs); SY.dirty=true; SY.again=true; }   // siguió editando mientras se enviaba
+    saveMeta(); cacheEvs(); render();
+    setSyn(SY.dirty?'Guardando...':'Sincronizado', !SY.dirty);
+  }catch(e){
+    saveMeta(); cacheEvs();
+    setSyn(SY.dirty?'Sin conexión — tus cambios se enviarán solos':'Sin conexión — reintentando', false);
+    SY.timer=setTimeout(syncNow, SY.retryMs); SY.retryMs=Math.min(SY.retryMs*2, 120000);
+  }finally{
+    SY.busy=false;
+    if(SY.again){ SY.again=false; setTimeout(syncNow, 300); }
   }
 }
-
-// ── LOAD / SAVE ───────────────────────────────────────────────
-async function loadEvs(showSpin=true){
-  if(showSpin) setSyn('Cargando...', false);
-  try {
-    const data=await jbGet();
-    events = Array.isArray(data) ? data : (data?.events||[...SEED]);
-    setSyn('Sincronizado', true);
-  } catch(e){
-    setSyn('Sin conexión — modo local', false);
-    const raw=localStorage.getItem('jp_evs_cache');
-    events = raw ? JSON.parse(raw) : [...SEED];
-    toast('Sin conexión — mostrando caché', false);
-  }
-  localStorage.setItem('jp_evs_cache', JSON.stringify(events));
+function canEdit(){
+  if(!SY.base && !SY.legacy){ toast('Conectando con el equipo… intenta en unos segundos', false); syncNow(); return false; }
+  return true;
+}
+function checkSetup(){
+  document.getElementById('appWrap').style.display='block';
+  if(!myName()) document.getElementById('myName').classList.add('warn');
+  loadEvs();
+}
+async function loadEvs(){
+  loadMeta();
+  let raw=null; try{ raw=JSON.parse(localStorage.getItem(LS_CACHE)||'null'); }catch(e){}
+  events = Array.isArray(raw) ? raw : [...SEED];
   render();
+  await syncNow();
+  window.addEventListener('online', ()=>syncNow());
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState==='hidden'){ if(SY.dirty) syncNow(); }
+    else if(Date.now()-SY.lastSync>60000) syncNow();
+  });
+  setInterval(()=>{ if(document.visibilityState==='visible' && !SY.busy && Date.now()-SY.lastSync>170000) syncNow(); }, 30000);
 }
-
 async function persistEvs(){
-  if(saving) return;
-  saving=true;
-  setSyn('Guardando...', false);
-  try {
-    await jbPut({events});
-    setSyn('Guardado ✓', true);
-    localStorage.setItem('jp_evs_cache', JSON.stringify(events));
-    setTimeout(()=>setSyn('Sincronizado', true), 2000);
-  } catch(e){
-    setSyn('Error al guardar', false);
-    toast('No se guardó en la nube: '+e.message, false);
-  }
-  saving=false;
+  SY.dirty=true; saveMeta(); cacheEvs();
+  await syncNow();
 }
 
 function setSyn(txt, ok){
@@ -508,7 +493,7 @@ function setSyn(txt, ok){
   if(ok) d.classList.remove('spin'); else d.classList.add('spin');
 }
 
-async function forceRefresh(){ await loadEvs(true); toast('Actualizado ↺'); }
+async function forceRefresh(){ await syncNow(); toast(SY.base && !SY.dirty ? 'Actualizado ↺' : 'Sin conexión — se reintentará solo', !!(SY.base && !SY.dirty)); }
 
 // ── IDENTITY ──────────────────────────────────────────────────
 function saveName(){
@@ -757,6 +742,7 @@ function toggleSU(){
 function closeM(id){ document.getElementById(id).classList.remove('on'); }
 
 async function saveEv(){
+  if(!canEdit()) return;
   const presenter=document.getElementById('iP').value.trim();
   const topic=document.getElementById('iT').value.trim();
   const notes=document.getElementById('iN').value.trim();
@@ -778,6 +764,7 @@ async function saveEv(){
 }
 
 async function delEv(){
+  if(!canEdit()) return;
   if(!editId||!confirm('¿Eliminar esta presentación?\n(También se borra la revisión previa con Paulina)')) return;
   events=events.filter(e=>e.id!=editId);
   closeM('addModal');
